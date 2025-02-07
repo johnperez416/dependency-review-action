@@ -3,64 +3,192 @@ import * as dependencyGraph from './dependency-graph'
 import * as github from '@actions/github'
 import styles from 'ansi-styles'
 import {RequestError} from '@octokit/request-error'
-import {Change, Severity, Changes} from './schemas'
+import {
+  Change,
+  Severity,
+  Changes,
+  ConfigurationOptions,
+  Scorecard
+} from './schemas'
 import {readConfig} from '../src/config'
 import {
   filterChangesBySeverity,
   filterChangesByScopes,
   filterAllowedAdvisories
 } from '../src/filter'
-import {getDeniedLicenseChanges} from './licenses'
+import {getInvalidLicenseChanges} from './licenses'
+import {getScorecardLevels} from './scorecard'
 import * as summary from './summary'
 import {getRefs} from './git-refs'
 
 import {groupDependenciesByManifest} from './utils'
+import {commentPr, MAX_COMMENT_LENGTH} from './comment-pr'
+import {getDeniedChanges} from './deny'
+
+async function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+async function getComparison(
+  baseRef: string,
+  headRef: string,
+  retryOpts?: {
+    retryUntil: number
+    retryDelay: number
+  }
+): ReturnType<typeof dependencyGraph.compare> {
+  const comparison = await dependencyGraph.compare({
+    owner: github.context.repo.owner,
+    repo: github.context.repo.repo,
+    baseRef,
+    headRef
+  })
+
+  if (comparison.snapshot_warnings.trim() !== '') {
+    core.info(comparison.snapshot_warnings)
+    if (retryOpts !== undefined) {
+      if (retryOpts.retryUntil < Date.now()) {
+        core.info(`Retry timeout exceeded. Proceeding...`)
+        return comparison
+      } else {
+        core.info(`Retrying in ${retryOpts.retryDelay} seconds...`)
+        await delay(retryOpts.retryDelay * 1000)
+        return getComparison(baseRef, headRef, retryOpts)
+      }
+    }
+  }
+
+  return comparison
+}
 
 async function run(): Promise<void> {
   try {
-    const config = readConfig()
+    const config = await readConfig()
+
     const refs = getRefs(config, github.context)
 
-    const changes = await dependencyGraph.compare({
-      owner: github.context.repo.owner,
-      repo: github.context.repo.repo,
-      baseRef: refs.base,
-      headRef: refs.head
-    })
+    const comparison = await getComparison(
+      refs.base,
+      refs.head,
+      config.retry_on_snapshot_warnings
+        ? {
+            retryUntil:
+              Date.now() + config.retry_on_snapshot_warnings_timeout * 1000,
+            retryDelay: 10
+          }
+        : undefined
+    )
 
-    const minSeverity = config.fail_on_severity as Severity
+    const changes = comparison.changes
+    const snapshot_warnings = comparison.snapshot_warnings
+
+    if (!changes) {
+      core.info('No Dependency Changes found. Skipping Dependency Review.')
+      return
+    }
+
     const scopedChanges = filterChangesByScopes(config.fail_on_scopes, changes)
+
     const filteredChanges = filterAllowedAdvisories(
       config.allow_ghsas,
       scopedChanges
     )
 
-    const addedChanges = filterChangesBySeverity(
+    const failOnSeverityParams = config.fail_on_severity
+    const warnOnly = config.warn_only
+    let minSeverity: Severity = 'low'
+    // If failOnSeverityParams is not set or warnOnly is true, the minSeverity is low, to allow all vulnerabilities to be reported as warnings
+    if (failOnSeverityParams && !warnOnly) {
+      minSeverity = failOnSeverityParams
+    }
+
+    const vulnerableChanges = filterChangesBySeverity(
       minSeverity,
       filteredChanges
-    ).filter(
-      change =>
-        change.change_type === 'added' &&
-        change.vulnerabilities !== undefined &&
-        change.vulnerabilities.length > 0
     )
 
-    const [licenseErrors, unknownLicenses] = await getDeniedLicenseChanges(
+    const invalidLicenseChanges = await getInvalidLicenseChanges(
       filteredChanges,
       {
         allow: config.allow_licenses,
-        deny: config.deny_licenses
+        deny: config.deny_licenses,
+        licenseExclusions: config.allow_dependencies_licenses
       }
     )
 
-    summary.addSummaryToSummary(addedChanges, licenseErrors, unknownLicenses)
-    summary.addChangeVulnerabilitiesToSummary(addedChanges, minSeverity)
-    summary.addLicensesToSummary(licenseErrors, unknownLicenses, config)
-    summary.addScannedDependencies(changes)
+    core.debug(`Filtered Changes: ${JSON.stringify(filteredChanges)}`)
+    core.debug(`Config Deny Packages: ${JSON.stringify(config)}`)
 
-    printVulnerabilitiesBlock(addedChanges, minSeverity)
-    printLicensesBlock(licenseErrors, unknownLicenses)
+    const deniedChanges = await getDeniedChanges(
+      filteredChanges,
+      config.deny_packages,
+      config.deny_groups
+    )
+
+    // generate informational scorecard entries for all added changes in the PR
+    const scorecardChanges = getScorecardChanges(changes)
+    const scorecard = await getScorecardLevels(scorecardChanges)
+
+    const minSummary = summary.addSummaryToSummary(
+      vulnerableChanges,
+      invalidLicenseChanges,
+      deniedChanges,
+      scorecard,
+      config
+    )
+
+    if (snapshot_warnings) {
+      summary.addSnapshotWarnings(config, snapshot_warnings)
+    }
+
+    let issueFound = false
+
+    if (config.vulnerability_check) {
+      core.setOutput('vulnerable-changes', JSON.stringify(vulnerableChanges))
+      summary.addChangeVulnerabilitiesToSummary(vulnerableChanges, minSeverity)
+      issueFound ||= await printVulnerabilitiesBlock(
+        vulnerableChanges,
+        minSeverity,
+        warnOnly
+      )
+    }
+    if (config.license_check) {
+      core.setOutput(
+        'invalid-license-changes',
+        JSON.stringify(invalidLicenseChanges)
+      )
+      summary.addLicensesToSummary(invalidLicenseChanges, config)
+      issueFound ||= await printLicensesBlock(invalidLicenseChanges, warnOnly)
+    }
+    if (config.deny_packages || config.deny_groups) {
+      core.setOutput('denied-changes', JSON.stringify(deniedChanges))
+      summary.addDeniedToSummary(deniedChanges)
+      issueFound ||= await printDeniedDependencies(deniedChanges, config)
+    }
+    if (config.show_openssf_scorecard) {
+      summary.addScorecardToSummary(scorecard, config)
+      printScorecardBlock(scorecard, config)
+      createScorecardWarnings(scorecard, config)
+    }
+
+    core.setOutput('dependency-changes', JSON.stringify(changes))
+    summary.addScannedFiles(changes)
     printScannedDependencies(changes)
+
+    // include full summary in output; Actions will truncate if oversized
+    let rendered = core.summary.stringify()
+    core.setOutput('comment-content', rendered)
+
+    // if the summary is oversized, replace with minimal version
+    if (rendered.length >= MAX_COMMENT_LENGTH) {
+      core.debug(
+        'The comment was too big for the GitHub API. Falling back on a minimum comment'
+      )
+      rendered = minSummary
+    }
+
+    // update the PR comment if needed with the right-sized summary
+    await commentPr(rendered, config, issueFound)
   } catch (error) {
     if (error instanceof RequestError && error.status === 404) {
       core.setFailed(
@@ -68,7 +196,7 @@ async function run(): Promise<void> {
       )
     } else if (error instanceof RequestError && error.status === 403) {
       core.setFailed(
-        `Dependency review is not supported on this repository. Please ensure that Dependency graph is enabled, see https://github.com/${github.context.repo.owner}/${github.context.repo.repo}/settings/security_analysis`
+        `Dependency review is not supported on this repository. Please ensure that Dependency graph is enabled along with GitHub Advanced Security on private repositories, see ${github.context.serverUrl}/${github.context.repo.owner}/${github.context.repo.repo}/settings/security_analysis`
       )
     } else {
       if (error instanceof Error) {
@@ -82,30 +210,36 @@ async function run(): Promise<void> {
   }
 }
 
-function printVulnerabilitiesBlock(
-  addedChanges: Change[],
-  minSeverity: Severity
-): void {
-  let failed = false
-  core.group('Vulnerabilities', async () => {
-    if (addedChanges.length > 0) {
-      for (const change of addedChanges) {
-        printChangeVulnerabilities(change)
-      }
-      failed = true
+async function printVulnerabilitiesBlock(
+  addedChanges: Changes,
+  minSeverity: Severity,
+  warnOnly: boolean
+): Promise<boolean> {
+  return core.group('Vulnerabilities', async () => {
+    let vulFound = false
+
+    for (const change of addedChanges) {
+      vulFound ||= printChangeVulnerabilities(change)
     }
 
-    if (failed) {
-      core.setFailed('Dependency review detected vulnerable packages.')
+    if (vulFound) {
+      const msg = 'Dependency review detected vulnerable packages.'
+      if (warnOnly) {
+        core.warning(msg)
+      } else {
+        core.setFailed(msg)
+      }
     } else {
       core.info(
         `Dependency review did not detect any vulnerable packages with severity level "${minSeverity}" or higher.`
       )
     }
+
+    return vulFound
   })
 }
 
-function printChangeVulnerabilities(change: Change): void {
+function printChangeVulnerabilities(change: Change): boolean {
   for (const vuln of change.vulnerabilities) {
     core.info(
       `${styles.bold.open}${change.manifest} » ${change.name}@${
@@ -116,27 +250,44 @@ function printChangeVulnerabilities(change: Change): void {
     )
     core.info(`  ↪ ${vuln.advisory_url}`)
   }
+  return change.vulnerabilities.length > 0
 }
 
-function printLicensesBlock(
-  licenseErrors: Change[],
-  unknownLicenses: Change[]
-): void {
-  core.group('Licenses', async () => {
-    if (licenseErrors.length > 0) {
-      printLicensesError(licenseErrors)
-      core.setFailed('Dependency review detected incompatible licenses.')
+async function printLicensesBlock(
+  invalidLicenseChanges: Record<string, Changes>,
+  warnOnly: boolean
+): Promise<boolean> {
+  return core.group('Licenses', async () => {
+    let issueFound = false
+
+    if (invalidLicenseChanges.forbidden.length > 0) {
+      issueFound = true
+      core.info('\nThe following dependencies have incompatible licenses:')
+      printLicensesError(invalidLicenseChanges.forbidden)
+      const msg = 'Dependency review detected incompatible licenses.'
+      if (warnOnly) {
+        core.warning(msg)
+      } else {
+        core.setFailed(msg)
+      }
     }
-    printNullLicenses(unknownLicenses)
+    if (invalidLicenseChanges.unresolved.length > 0) {
+      issueFound = true
+      core.warning(
+        '\nThe validity of the licenses of the dependencies below could not be determined. Ensure that they are valid SPDX licenses:'
+      )
+      printLicensesError(invalidLicenseChanges.unresolved)
+      core.setFailed(
+        'Dependency review could not detect the validity of all licenses.'
+      )
+    }
+    printNullLicenses(invalidLicenseChanges.unlicensed)
+
+    return issueFound
   })
 }
 
-function printLicensesError(changes: Change[]): void {
-  if (changes.length === 0) {
-    return
-  }
-
-  core.info('\nThe following dependencies have incompatible licenses:\n')
+function printLicensesError(changes: Changes): void {
   for (const change of changes) {
     core.info(
       `${styles.bold.open}${change.manifest} » ${change.name}@${change.version}${styles.bold.close} – License: ${styles.color.red.open}${change.license}${styles.color.red.close}`
@@ -144,17 +295,40 @@ function printLicensesError(changes: Change[]): void {
   }
 }
 
-function printNullLicenses(changes: Change[]): void {
+function printNullLicenses(changes: Changes): void {
   if (changes.length === 0) {
     return
   }
 
-  core.info('\nWe could not detect a license for the following dependencies:\n')
+  core.info('\nWe could not detect a license for the following dependencies:')
   for (const change of changes) {
     core.info(
       `${styles.bold.open}${change.manifest} » ${change.name}@${change.version}${styles.bold.close}`
     )
   }
+}
+
+function printScorecardBlock(
+  scorecard: Scorecard,
+  config: ConfigurationOptions
+): void {
+  core.group('Scorecard', async () => {
+    if (scorecard) {
+      for (const dependency of scorecard.dependencies) {
+        if (
+          dependency.scorecard?.score &&
+          dependency.scorecard?.score < config.warn_on_openssf_scorecard_level
+        ) {
+          core.info(
+            `${styles.color.red.open}${dependency.change.ecosystem}/${dependency.change.name}: OpenSSF Scorecard Score: ${dependency?.scorecard?.score}${styles.red.close}`
+          )
+        }
+        core.info(
+          `${dependency.change.ecosystem}/${dependency.change.name}: OpenSSF Scorecard Score: ${dependency?.scorecard?.score}`
+        )
+      }
+    }
+  })
 }
 
 function renderSeverity(
@@ -207,6 +381,64 @@ function printScannedDependencies(changes: Changes): void {
       }
     }
   })
+}
+
+async function printDeniedDependencies(
+  changes: Changes,
+  config: ConfigurationOptions
+): Promise<boolean> {
+  return core.group('Denied', async () => {
+    let issueFound = false
+
+    for (const denied of config.deny_packages) {
+      core.info(`Config: ${denied}`)
+    }
+
+    for (const change of changes) {
+      core.info(`Change: ${change.name}@${change.version} is denied`)
+      core.info(`Change: ${change.package_url} is denied`)
+    }
+
+    if (changes.length > 0) {
+      issueFound = true
+      core.setFailed('Dependency review detected denied packages.')
+    } else {
+      core.info('Dependency review did not detect any denied packages')
+    }
+
+    return issueFound
+  })
+}
+
+function getScorecardChanges(changes: Changes): Changes {
+  const out: Changes = []
+  for (const change of changes) {
+    if (change.change_type === 'added') {
+      out.push(change)
+    }
+  }
+
+  return out
+}
+
+async function createScorecardWarnings(
+  scorecards: Scorecard,
+  config: ConfigurationOptions
+): Promise<void> {
+  // Iterate through the list of scorecards, and if the score is less than the threshold, send a warning
+  for (const dependency of scorecards.dependencies) {
+    if (
+      dependency.scorecard?.score &&
+      dependency.scorecard?.score < config.warn_on_openssf_scorecard_level
+    ) {
+      core.warning(
+        `${dependency.change.ecosystem}/${dependency.change.name} has an OpenSSF Scorecard of ${dependency.scorecard?.score}, which is less than this repository's threshold of ${config.warn_on_openssf_scorecard_level}.`,
+        {
+          title: 'OpenSSF Scorecard Warning'
+        }
+      )
+    }
+  }
 }
 
 run()
